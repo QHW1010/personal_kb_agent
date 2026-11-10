@@ -1,7 +1,7 @@
 # Personal KB Agent · 个人知识库问答 Agent
 
 一个可直接部署的个人知识库问答服务：**FastAPI + LangGraph StateGraph + 向量检索/重排 + NL2SQL**，
-带 JWT 鉴权、SSE 流式输出、Token 成本台账与 Docker Compose 一键启动。
+带 JWT 鉴权、SSE 流式输出、Token 成本台账，以及可一键启动的 Docker Compose 编排。
 
 > 定位：求职作品 / 生产级 RAG 骨架。所有 Agent 产出必须通过 Pydantic 模式校验才会返回用户。
 
@@ -20,6 +20,7 @@
 - [设计取舍](#设计取舍)
 - [测试](#测试)
 - [路线图](#路线图)
+- [演示截图](#演示截图)
 
 ---
 
@@ -121,13 +122,17 @@ client ──POST /chat──▶ auth ─▶ rate limit ─▶ load last N turns
 | 认证 | JWT（PyJWT）+ bcrypt | 不使用 passlib，规避其与 bcrypt 4.x 的兼容问题 |
 | 流式 | SSE + `stream_mode="messages"` | 关闭 nginx 缓冲（`X-Accel-Buffering: no`） |
 | 测试 | pytest + pytest-asyncio + httpx | 覆盖认证、RAG、NL2SQL、SSE、守卫 |
-| 部署 | Docker Compose | api + postgres + redis |
+| 部署 | Docker Compose | api + postgres + redis；配置就绪，待本机 Docker 环境可用后验证 |
 
 ---
 
 ## 快速开始
 
 ### 方式一：Docker Compose（一键）
+
+> **状态：配置就绪，待本机 Docker 环境可用后验证。**
+>
+> `Dockerfile` 与 `docker-compose.yml` 已按生产路径写好（多阶段构建、非 root 运行、启动前执行 `alembic upgrade head`、健康检查串联启动顺序），但开发本机当时没有可用的 Docker daemon，因此这条路径**尚未实际跑通**。下方命令是设计意图，首次使用请以实际输出为准；本地已完整验证的是下方的「方式二」。
 
 ```bash
 cp .env.example .env
@@ -416,11 +421,26 @@ pytest --cov=app      # 需 pip install pytest-cov
 
 ## 演示截图
 
-> 运行 `docker compose up` 后访问 `/docs`，截图放在此处：
->
-> - `docs/images/swagger.png` — Swagger UI 全量接口
-> - `docs/images/stream.png` — SSE 流式对话（curl -N）
-> - `docs/images/usage.png` — Token 与成本汇总
+以下截图均取自本地实际运行（`127.0.0.1:8000`，Chroma 向量库 + 离线确定性模型），不是设计稿。
+
+### Swagger UI · 全量接口
+
+![Swagger UI 全量接口](docs/images/swagger.png)
+
+5 个分组（health / auth / chat / knowledge / meta）共 14 条接口，点开即调，鉴权走右上角 `Authorize`。
+
+### SSE 流式对话
+
+![SSE 流式输出](docs/images/stream.png)
+
+`curl -N` 的真实响应：`event: start` → 24 个 `event: token`（逐字到达，非一次性返回）→ `event: done`。
+该次问答 prompt 575 + completion 204 = 779 tokens，耗时 162 ms，带 3 条知识库引用。
+
+### Token 用量与成本汇总
+
+![Token 用量与成本汇总](docs/images/usage.png)
+
+每次对话自动写入一条 `usage_records`；`/api/v1/chat/usage` 按用户汇总调用次数、prompt/completion tokens 与估算 USD 成本，无需额外埋点。
 
 ---
 
