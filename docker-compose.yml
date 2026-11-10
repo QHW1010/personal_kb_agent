@@ -1,0 +1,78 @@
+# 一键启动：api + PostgreSQL + Redis
+# 用法： cp .env.example .env && docker compose up --build
+name: personal-kb-agent
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-kb}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-kb_password}
+      POSTGRES_DB: ${POSTGRES_DB:-kb}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-kb} -d ${POSTGRES_DB:-kb}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    ports:
+      - "5432:5432"
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    ports:
+      - "6379:6379"
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      ENV: prod
+      DEBUG: "false"
+      LOG_LEVEL: INFO
+      SECRET_KEY: ${SECRET_KEY:-change-me-in-production-please-use-32-bytes-min}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-kb}:${POSTGRES_PASSWORD:-kb_password}@db:5432/${POSTGRES_DB:-kb}
+      REDIS_URL: redis://redis:6379/0
+      # 生产环境用 Alembic 迁移建表，关闭运行时自动建表
+      AUTO_CREATE_TABLES: "false"
+      VECTOR_BACKEND: ${VECTOR_BACKEND:-chroma}
+      CHROMA_DIR: /app/data/chroma
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-hashing}
+      LLM_PROVIDER: ${LLM_PROVIDER:-fake}
+      LLM_MODEL: ${LLM_MODEL:-gpt-4o-mini}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-30}
+    command: >
+      sh -c "alembic upgrade head &&
+             uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers"
+    ports:
+      - "8000:8000"
+    volumes:
+      - chromadata:/app/data/chroma
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health/live"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  redisdata:
+  chromadata:
