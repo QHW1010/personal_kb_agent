@@ -1,0 +1,7 @@
+# 统一换行，避免 Windows 开发者把整个仓库变成 CRLF
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.pdf binary
+*.db binary

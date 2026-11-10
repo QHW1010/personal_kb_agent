@@ -1,0 +1,12 @@
+# 可选：接入真实大模型
+# 安装：pip install -r requirements-llm.txt
+# 然后在 .env 中设置：
+#   LLM_PROVIDER=openai
+#   LLM_API_KEY=sk-xxx
+#   LLM_MODEL=gpt-4o-mini
+#   LLM_BASE_URL=            # 走 Azure / 兼容网关时填写
+langchain-openai>=0.2.10,<0.4
+
+# 可选：更强的 embedding 与重排序模型（首次运行会下载权重）
+# 安装后设置 EMBEDDING_PROVIDER=sentence-transformers / RERANKER=cross-encoder
+sentence-transformers>=3.2,<4.0

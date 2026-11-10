@@ -1,0 +1,31 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# ---- 本地数据（不提交知识库与索引）----
+data/*.db
+data/*.sqlite3
+data/memory_store.json
+data/chroma/
+data/uploads/
+!data/.gitkeep
+
+# ---- 环境变量 ----
+.env
+.env.local
+
+# ---- 编辑器 / 系统 ----
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# ---- 运行产物 ----
+*.log
+logs/
