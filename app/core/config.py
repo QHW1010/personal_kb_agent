@@ -10,10 +10,15 @@ import os
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 
+# langchain_openai 内部用 tiktoken 估算 token，首次调用要下载 1.6MB 的 BPE 词典
+# （实测 4.7 秒，且默认落在系统临时目录，容器一重启就没了）。
+# 固定在项目数据目录，配合 .gitignore 与 docker 卷，冷启动只付一次成本。
+os.environ.setdefault("TIKTOKEN_CACHE_DIR", "./data/tiktoken")
+
 from functools import lru_cache  # noqa: E402
 from typing import Literal  # noqa: E402
 
-from pydantic import Field  # noqa: E402
+from pydantic import AliasChoices, Field  # noqa: E402
 from pydantic_settings import BaseSettings, SettingsConfigDict  # noqa: E402
 
 
@@ -99,11 +104,30 @@ class Settings(BaseSettings):
     # ---------- LLM ----------
     # fake = 离线确定性模型（无 Key 也能跑通全链路、可跑测试）
     llm_provider: Literal["fake", "openai"] = "fake"
-    llm_model: str = "gpt-4o-mini"
-    llm_base_url: str | None = None
-    llm_api_key: str | None = None
+    # env 里 LLM_MODEL 和 MODEL_NAME 两种写法都认（DeepSeek 官方示例用后者）
+    llm_model: str = Field(
+        default="deepseek-chat",
+        validation_alias=AliasChoices("LLM_MODEL", "MODEL_NAME"),
+    )
+    llm_base_url: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("LLM_BASE_URL", "OPENAI_BASE_URL"),
+    )
+    llm_api_key: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("LLM_API_KEY", "OPENAI_API_KEY"),
+    )
     llm_temperature: float = 0.2
     llm_max_tokens: int = 1024
+
+    # 意图路由是短分类任务，给 20s 足够；正文生成要留足时间，
+    # 复用 tool_timeout(10s) 会把长答案直接掐断
+    llm_intent_timeout_seconds: float = 20.0
+    llm_timeout_seconds: float = 90.0
+    llm_max_retries: int = 2
+    # 启动期打一次 1-token 请求，把建连与 tiktoken 加载（实测约 7s）挪到启动阶段。
+    # 本地 --reload 频繁重启时可关掉，代价是首个问题慢几秒。
+    llm_warmup: bool = True
 
     # ---------- 成本核算（USD / 1K tokens） ----------
     price_prompt_per_1k: float = 0.00015

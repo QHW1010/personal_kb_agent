@@ -1,10 +1,10 @@
-# 可选：接入真实大模型
+# 可选：接入真实大模型（DeepSeek / 通义 / vLLM / Azure，任何 OpenAI 兼容网关）
 # 安装：pip install -r requirements-llm.txt
-# 然后在 .env 中设置：
+# 然后在 .env 中设置（DeepSeek 示例）：
 #   LLM_PROVIDER=openai
-#   LLM_API_KEY=sk-xxx
-#   LLM_MODEL=gpt-4o-mini
-#   LLM_BASE_URL=            # 走 Azure / 兼容网关时填写
+#   OPENAI_API_KEY=sk-xxx          # 也认 LLM_API_KEY
+#   OPENAI_BASE_URL=https://api.deepseek.com/v1
+#   MODEL_NAME=deepseek-chat       # 也认 LLM_MODEL
 langchain-openai>=0.2.10,<0.4
 
 # 注意：embedding 已改用 fastembed（见 requirements.txt），不再需要 torch。
