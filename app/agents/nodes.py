@@ -169,7 +169,8 @@ async def route_node(state: AgentState) -> dict[str, Any]:
 
 async def retrieve_node(state: AgentState) -> dict[str, Any]:
     question = state["question"]
-    hits = await retrieve(question)
+    # top_k 由 ChatRequest 透传（None 时走全局配置），不再是死参数
+    hits = await retrieve(question, top_k=state.get("top_k"))
     citations = [c.model_dump() for c in hits_to_citations(hits)]
     return {
         "hits": [

@@ -21,7 +21,11 @@ _FORBIDDEN_SQL = re.compile(
 
 
 class Citation(BaseModel):
-    """一条可追溯的证据。chunk_id 用于回查向量库。"""
+    """一条可追溯的证据。chunk_id 用于回查向量库。
+
+    定位字段全部有默认值：历史消息里存的旧 citation（无这些 key）仍能反序列化，
+    不需要数据迁移。
+    """
 
     chunk_id: str
     document_id: str = ""
@@ -29,6 +33,11 @@ class Citation(BaseModel):
     source: str = "kb"
     snippet: str = Field(max_length=800)
     score: float = Field(default=0.0, ge=0.0, le=1.0)
+    # 段落级溯源：第几段、在原文中的字符区间、所属标题路径
+    paragraph_index: int | None = None
+    char_start: int | None = None
+    char_end: int | None = None
+    section: str = ""
 
 
 class Usage(BaseModel):

@@ -22,6 +22,8 @@ class AgentState(TypedDict, total=False):
     user_id: str
     # 路由结果：rag | sql | direct
     route: str
+    # 本轮检索条数（来自 ChatRequest.top_k，None 表示用全局配置）
+    top_k: int | None
     # 检索命中的片段（已序列化，便于跨节点传递/落库）
     hits: list[dict[str, Any]]
     citations: list[dict[str, Any]]
@@ -46,6 +48,7 @@ def new_state(
     messages: list[BaseMessage],
     conversation_id: str,
     user_id: str,
+    top_k: int | None = None,
 ) -> AgentState:
     return AgentState(
         messages=messages,
@@ -53,6 +56,7 @@ def new_state(
         conversation_id=conversation_id,
         user_id=user_id,
         route="rag",
+        top_k=top_k,
         hits=[],
         citations=[],
         sql=None,

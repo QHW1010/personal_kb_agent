@@ -151,12 +151,19 @@ def validate_answer(state: AgentState, *, latency_ms: int) -> AgentAnswer:
     return answer
 
 
-def _initial_state(user_id: str, conversation_id: str, message: str, history: list[BaseMessage]) -> AgentState:
+def _initial_state(
+    user_id: str,
+    conversation_id: str,
+    message: str,
+    history: list[BaseMessage],
+    top_k: int | None = None,
+) -> AgentState:
     return new_state(
         question=message,
         messages=history,
         conversation_id=conversation_id,
         user_id=user_id,
+        top_k=top_k,
     )
 
 
@@ -190,7 +197,7 @@ async def ask(
     history = await load_history(user_id, conversation_id, cfg.history_max_turns)
     await _persist_user_message(user_id, conversation_id, message)
 
-    state = _initial_state(user_id, conversation_id, message, history)
+    state = _initial_state(user_id, conversation_id, message, history, top_k)
     graph = get_graph()
     result: AgentState = await graph.ainvoke(state)  # type: ignore[assignment]
 
@@ -225,7 +232,7 @@ async def stream(
 
     yield sse_event("start", {"conversation_id": conversation_id, "model": model_display_name()})
 
-    state = _initial_state(user_id, conversation_id, message, history)
+    state = _initial_state(user_id, conversation_id, message, history, top_k)
     graph = get_graph()
 
     emitted: list[str] = []

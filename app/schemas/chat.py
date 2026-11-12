@@ -58,3 +58,7 @@ class KnowledgeStats(BaseModel):
     backend: str
     embedding_provider: str
     reranker: str
+    # 阶段二新增：换模型/换集合时靠这三个字段判断"到底在查哪份索引"
+    embedding_model: str = ""
+    embedding_dim: int = 0
+    collection: str = ""
