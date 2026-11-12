@@ -21,7 +21,8 @@ from app.core.config import get_settings
 from app.core.errors import register_exception_handlers
 from app.core.logging import configure_logging, get_logger
 from app.db.session import dispose_engine, get_session_factory, init_models
-from app.rag.ingest import seed_demo_knowledge
+from app.rag.embeddings import warmup_embedder
+from app.rag.ingest import ensure_index_ready
 from app.rag.vectorstore import get_vector_store
 
 logger = get_logger(__name__)
@@ -40,10 +41,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await init_models()
 
     try:
+        # 预热真实 embedding：把「下载权重 + 建 onnx session」从首个请求挪到启动期。
+        # 失败不阻断启动，只是首个请求会慢（/health 会体现 embedding 状态）。
+        if not await warmup_embedder():
+            logger.warning("embedder_warmup_failed, first request may be slow")
+
         backend = get_vector_store().name
         factory = get_session_factory()
         async with factory() as session:
-            seeded = await seed_demo_knowledge(session)
+            seeded = await ensure_index_ready(session, seed_demo=cfg.seed_demo_docs)
         logger.info("startup_ready vectorstore=%s seeded_docs=%d", backend, seeded)
     except Exception as exc:  # noqa: BLE001 - 索引初始化失败不阻断启动，/health 会报 degraded
         logger.exception("startup_index_init_failed: %s", exc)
