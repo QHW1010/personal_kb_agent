@@ -2,20 +2,25 @@
 
 切换 Qdrant / Pinecone 只需新增一个 VectorStore 实现并改 get_vector_store()，
 上层 retriever / ingest 不受影响。
+
+阶段二增加了两件事：
+1. 集合名按 embedding provider+model+dim 版本化，换模型不会污染旧索引；
+2. chunk_id 改为确定性哈希，配合 upsert 让重复入库幂等。
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
+import re
 import threading
-import uuid
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 # 必须在 import chromadb 之前设置：chromadb 在导入时就会读这个开关，
-# 晚了就关不掉匿名遥测（离线环境下它会持续刷 ERROR 日志）。
+# 晚了就关不掉匿名遥测（离线环境下它会持续报错刷屏）。
 os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
 os.environ.setdefault("CHROMA_ANONYMIZED_TELEMETRY", "False")
 
@@ -48,6 +53,7 @@ class VectorStore(Protocol):
     async def search(self, vector: list[float], top_k: int) -> list[Hit]: ...
     async def count(self) -> int: ...
     async def reset(self) -> None: ...
+    async def delete_document(self, document_id: str) -> None: ...
 
 
 def _cosine(a: list[float], b: list[float]) -> float:
@@ -116,13 +122,26 @@ class InMemoryVectorStore:
             self._items.clear()
             self._persist()
 
+    async def delete_document(self, document_id: str) -> None:
+        with self._lock:
+            doomed = [
+                key
+                for key, (_vec, chunk) in self._items.items()
+                if str(chunk.metadata.get("document_id", "")) == document_id
+            ]
+            for key in doomed:
+                self._items.pop(key, None)
+            if doomed:
+                self._persist()
+        logger.info("memory_delete_document document_id=%s chunks=%d", document_id, len(doomed))
+
 
 class ChromaVectorStore:
     """Chroma 持久化实现。Chroma SDK 是同步的，统一丢线程池 + 超时。"""
 
     name = "chroma"
 
-    def __init__(self, persist_dir: str, collection: str) -> None:
+    def __init__(self, persist_dir: str, collection: str, *, expected_dim: int | None = None) -> None:
         import logging
 
         # 客户端构造时就会发遥测事件，所以静音必须在构造之前完成
@@ -132,29 +151,56 @@ class ChromaVectorStore:
         from chromadb.config import Settings as ChromaSettings
 
         os.makedirs(persist_dir, exist_ok=True)
+        self._dim = expected_dim
         self._client = chromadb.PersistentClient(
             path=persist_dir,
             settings=ChromaSettings(anonymized_telemetry=False, allow_reset=True),
         )
+        metadata: dict[str, Any] = {"hnsw:space": "cosine"}
+        if expected_dim:
+            metadata["embedding_dim"] = int(expected_dim)
         self._collection = self._client.get_or_create_collection(
             name=collection,
-            metadata={"hnsw:space": "cosine"},
+            metadata=metadata,
         )
-        logger.info("chroma_ready dir=%s collection=%s", persist_dir, collection)
+
+        # 维度守卫：集合已存在且记录了维度，就必须和当前 embedder 一致，
+        # 否则写入会抛出难懂的 InvalidDimensionError。
+        existing_dim = (self._collection.metadata or {}).get("embedding_dim")
+        if expected_dim and existing_dim and int(existing_dim) != int(expected_dim):
+            raise ValueError(
+                f"集合 {collection} 维度 {existing_dim} 与当前 embedder 维度 {expected_dim} 不一致；"
+                "请更换 CHROMA_COLLECTION 或清空该集合的索引"
+            )
+        if expected_dim and not existing_dim:
+            logger.warning(
+                "collection_dim_unknown collection=%s (旧集合，未记录维度)", collection
+            )
+        logger.info(
+            "chroma_ready dir=%s collection=%s dim=%s", persist_dir, collection, expected_dim
+        )
 
     async def add(self, chunks: list[Chunk], vectors: list[list[float]]) -> None:
         if not chunks:
             return
+        if len(chunks) != len(vectors):
+            raise ValueError(f"chunks({len(chunks)}) 与 vectors({len(vectors)}) 数量不一致")
+        if self._dim and vectors and len(vectors[0]) != self._dim:
+            raise ValueError(
+                f"向量维度 {len(vectors[0])} 与集合维度 {self._dim} 不一致，拒绝写入"
+            )
 
-        def _add() -> None:
-            self._collection.add(
+        def _upsert() -> None:
+            # upsert 而非 add：同一 chunk_id 重复写入是幂等的，
+            # 中断后重跑不会因为 duplicate id 报错
+            self._collection.upsert(
                 ids=[c.chunk_id for c in chunks],
                 embeddings=vectors,
                 documents=[c.text for c in chunks],
                 metadatas=[c.metadata for c in chunks],
             )
 
-        await run_blocking(_add, label="chroma.add")
+        await run_blocking(_upsert, label="chroma.upsert")
 
     async def search(self, vector: list[float], top_k: int) -> list[Hit]:
         def _query() -> dict[str, Any]:
@@ -193,8 +239,35 @@ class ChromaVectorStore:
 
         await run_blocking(_reset, label="chroma.reset")
 
+    async def delete_document(self, document_id: str) -> None:
+        def _delete() -> None:
+            self._collection.delete(where={"document_id": document_id})
+
+        await run_blocking(_delete, label="chroma.delete")
+        logger.info("chroma_delete_document document_id=%s", document_id)
+
 
 _store: VectorStore | None = None
+
+_COLLECTION_SAFE_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _slug(text: str) -> str:
+    return _COLLECTION_SAFE_RE.sub("_", text.lower()).strip("_")
+
+
+def collection_name_for(base: str, provider: str, model: str | None, dim: int) -> str:
+    """按模型版本化集合名，避免换 embedding 后污染旧索引。
+
+    hashing 保持用基础名（旧数据完全不动）；
+    fastembed 派生成 kb_documents_fastembed_bge_small_zh_v1_5_512 这类名字。
+    Chroma 要求 3-63 个字符、以字母数字开头结尾。
+    """
+    if provider == "hashing":
+        return base
+    suffix = _slug(model or provider)[:40]
+    name = f"{base}_{_slug(provider)}_{suffix}_{dim}"
+    return name[:63].rstrip("_-")
 
 
 def get_vector_store() -> VectorStore:
@@ -208,8 +281,18 @@ def get_vector_store() -> VectorStore:
         logger.info("vectorstore=memory (forced)")
         return _store
 
+    # 延迟 import：embeddings 只依赖 config，不会形成循环
+    from app.rag.embeddings import get_embedder
+
+    embedder = get_embedder()
+    collection = collection_name_for(
+        cfg.chroma_collection,
+        cfg.embedding_provider,
+        cfg.embedding_model if cfg.embedding_provider != "hashing" else None,
+        embedder.dim,
+    )
     try:
-        _store = ChromaVectorStore(cfg.chroma_dir, cfg.chroma_collection)
+        _store = ChromaVectorStore(cfg.chroma_dir, collection, expected_dim=embedder.dim)
     except Exception as exc:  # noqa: BLE001 - 缺依赖/目录不可写都降级
         if cfg.vector_backend == "chroma":
             raise
@@ -223,14 +306,50 @@ def set_vector_store(store: VectorStore | None) -> None:
     _store = store
 
 
-def make_chunk(text: str, *, document_id: str, title: str, source: str, index: int) -> Chunk:
+def current_collection_name() -> str:
+    """当前生效的集合名（脚本与 /knowledge/stats 用来暴露真实状态）。"""
+    cfg = get_settings()
+    from app.rag.embeddings import get_embedder
+
+    embedder = get_embedder()
+    return collection_name_for(
+        cfg.chroma_collection,
+        cfg.embedding_provider,
+        cfg.embedding_model if cfg.embedding_provider != "hashing" else None,
+        embedder.dim,
+    )
+
+
+def make_chunk(
+    text: str,
+    *,
+    document_id: str,
+    title: str,
+    source: str,
+    index: int,
+    paragraph_index: int = 0,
+    char_start: int = 0,
+    char_end: int = 0,
+    section: str = "",
+    kind: str = "text",
+) -> Chunk:
+    """构造切片。chunk_id 由内容决定，重复入库得到同一个 id（配合 upsert 幂等）。
+
+    元数据全部为 str/int（Chroma 不接受 None）。
+    """
+    raw = f"{document_id}|{index}|{text}".encode()
     return Chunk(
-        chunk_id=uuid.uuid4().hex,
+        chunk_id=hashlib.sha1(raw).hexdigest(),
         text=text,
         metadata={
             "document_id": document_id,
             "title": title,
             "source": source,
-            "chunk_index": index,
+            "chunk_index": int(index),
+            "paragraph_index": int(paragraph_index),
+            "char_start": int(char_start),
+            "char_end": int(char_end),
+            "section": section or "",
+            "kind": kind or "text",
         },
     )

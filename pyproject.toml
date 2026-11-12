@@ -17,6 +17,10 @@ asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "session"
 testpaths = ["tests"]
 addopts = "-q --strict-markers"
+# strict-markers 下未注册的 marker 会直接报错，这里显式声明
+markers = [
+    "integration: 需要真实模型/网络的测试，默认跳过（RUN_FASTEMBED_IT=1 才跑）",
+]
 filterwarnings = [
     "ignore::DeprecationWarning",
     "ignore::pytest.PytestUnraisableExceptionWarning",
