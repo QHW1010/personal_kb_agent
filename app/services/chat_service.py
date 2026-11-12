@@ -23,6 +23,7 @@ from app.core.errors import AgentOutputError
 from app.core.logging import get_logger
 from app.db.models import ChatMessage
 from app.db.session import get_session_factory
+from app.rag.citation_guard import filter_citations_by_hits
 from app.schemas.agent import AgentAnswer
 from app.schemas.chat import ChatResponse
 from app.services.usage import build_usage, estimate_tokens, record_usage
@@ -124,10 +125,23 @@ def validate_answer(state: AgentState, *, latency_ms: int) -> AgentAnswer:
     prompt_tokens = int(state.get("prompt_tokens") or 0)
     completion_tokens = int(state.get("completion_tokens") or estimate_tokens(answer_text))
 
+    # 出口兜底：引用只能属于本轮检索命中的 chunk。
+    # 多轮对话里历史 citations 若混进 state，用户会看到"这一轮的答案
+    # 引用了这一轮根本没查过的段落"，比没有引用更难察觉。
+    citations, leaked = filter_citations_by_hits(
+        state.get("citations") or [], state.get("hits") or []
+    )
+    if leaked:
+        logger.warning(
+            "citations_out_of_scope dropped=%d conversation=%s",
+            leaked,
+            state.get("conversation_id"),
+        )
+
     payload = {
         "answer": answer_text,
         "route": route,
-        "citations": state.get("citations") or [],
+        "citations": citations,
         "sql": sql,
         "rows": rows,
         "confidence": float(state.get("confidence") or 0.5),

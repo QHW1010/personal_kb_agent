@@ -24,6 +24,7 @@ from app.core.errors import ToolExecutionError
 from app.core.logging import get_logger
 from app.core.resilience import call_with_resilience
 from app.db.session import get_session_factory
+from app.rag.citation_guard import align_citation_marks, sanitize_history
 from app.rag.retriever import hits_to_citations, retrieve
 from app.schemas.agent import SQLPlan
 from app.services.usage import estimate_tokens
@@ -262,6 +263,10 @@ async def retrieve_node(state: AgentState) -> dict[str, Any]:
     question = state["question"]
     # top_k 由 ChatRequest 透传（None 时走全局配置），不再是死参数
     hits = await retrieve(question, top_k=state.get("top_k"))
+    # 只描述本轮问题检索到的内容。hits / citations 是覆盖语义（不是
+    # add_messages 那种累加 reducer），所以上一轮的引用不会留在这里；
+    # 真正的跨轮污染发生在提示词侧（历史答案被模型照抄），由
+    # synthesize_node 的 sanitize_history() 处理。
     citations = [c.model_dump() for c in hits_to_citations(hits)]
     return {
         "hits": [
@@ -357,19 +362,18 @@ def _usage_to_tokens(usage: Any) -> tuple[int, int]:
     return int(prompt), int(completion)
 
 
-_CITE_MARK_RE = re.compile(r"\s*\[\d+(?:\s*[,，]\s*\d+)*\]")
-
-
 def strip_unsupported_citation_marks(answer: str, citations: list[dict[str, Any]]) -> str:
-    """没有引用时，把模型自作主张写的 [1] 抹掉。
+    """把答案里的 [n] 校正到当前轮 citations 的范围内。
 
-    引用列表是唯一事实来源。留着裸的 [1] 会让前端渲染成指向不存在的来源，
-    比不给标记更糟。有引用时原样保留 —— 那是模型按提示词要求标注的。
+    引用列表是唯一事实来源：没有引用就全抹掉，有引用则逐条校验编号，
+    越界的删掉。留着裸的 [7] 会让前端渲染成指向不存在来源的链接，
+    比不给标记更糟。
+
+    真正的实现在 app.rag.citation_guard，这里保留旧名字是为了不破坏
+    已有的调用点与测试。
     """
-    if citations or not answer:
-        return answer
-    cleaned = _CITE_MARK_RE.sub("", answer)
-    return re.sub(r"[ \t]{2,}", " ", cleaned).strip()
+    cleaned, _ = align_citation_marks(answer, citations)
+    return cleaned
 
 
 def _prompt_for_route(state: AgentState, context: str) -> str:
@@ -391,7 +395,7 @@ async def synthesize_node(state: AgentState) -> dict[str, Any]:
     context = _build_context_block(state)
     system = SystemMessage(content=_prompt_for_route(state, context))
 
-    history = state.get("messages") or []
+    history = sanitize_history(state.get("messages") or [])
     messages = [system, *[m for m in history if m.type != "system"], HumanMessage(content=question)]
 
     model = get_chat_model()
@@ -425,7 +429,16 @@ async def synthesize_node(state: AgentState) -> dict[str, Any]:
 
     if not answer.strip():
         answer = "抱歉，本次生成没有返回有效内容，请换个问法再试一次。"
-    answer = strip_unsupported_citation_marks(answer, state.get("citations") or [])
+    citations = state.get("citations") or []
+    answer, dropped_marks = align_citation_marks(answer, citations)
+    if dropped_marks:
+        # 越界编号说明模型在编引用，值得留痕观察
+        logger.warning(
+            "citation_marks_dropped conversation=%s dropped=%s citations=%d",
+            state.get("conversation_id"),
+            dropped_marks,
+            len(citations),
+        )
 
     hits = state.get("hits") or []
     prompt_text = system.content + "\n" + question + "\n" + "".join(
