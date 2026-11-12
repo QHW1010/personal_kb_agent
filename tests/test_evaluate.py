@@ -69,11 +69,14 @@ def test_mrr_uses_reciprocal_rank() -> None:
 
 def test_eval_set_is_well_formed() -> None:
     """评估集的每道题都必须有来源与锚点，否则判分永远是 0。"""
-    assert len(EVAL_SET) == 5
+    assert 30 <= len(EVAL_SET) <= 50, "题量太少撑不起统计，太多则维护成本过高"
     for case in EVAL_SET:
         assert case.question.strip()
         assert case.source.endswith(".md")
         assert case.anchor.strip()
+    # 题面不能重复：重复题会让均值被同一道题拉偏
+    questions = [case.question for case in EVAL_SET]
+    assert len(set(questions)) == len(questions)
 
 
 def test_display_width_counts_cjk_as_two() -> None:

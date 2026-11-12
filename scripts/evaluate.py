@@ -5,20 +5,22 @@
     python -m scripts.evaluate --top-k 8       # 加深召回池
     python -m scripts.evaluate --json          # 给 CI 消费
     python -m scripts.evaluate --show-hits     # 打印每题命中的片段，排障用
+    python -m scripts.evaluate --limit 10      # 只跑前 10 题，改指标时省时间
 
 判分方式（故意做得严格）：
 一个片段算「相关」必须同时满足两条 —— 来源文件名对得上，且正文里含这道题
 的锚点原文。只对文件名会让同一篇文档里的任意片段都算命中，指标会虚高到
 没有意义；只看锚点又会让别的文档碰巧复述同一句话时算错。
 
-输出两套数字：
+输出三套数字：
 - 向量粗召回（search_vectors）—— 衡量 embedding 本身的能力；
-- 全链路（retrieve，含重排）—— 衡量线上真正用的那条路径。
-两者对比才能说明重排到底有没有价值。
+- 全链路 top-5（retrieve，含重排）—— 衡量线上那条路径的上限；
+- 线上 top-3（与 RAG_RERANK_TOP_N 一致）—— 用户真正拿到的东西。
+前两者对比才能说明重排有没有价值；第三者用来对齐忠实度评估（提示词里就这 3 条）。
 
-注意样本量：5 道题足以发现「某一类问题完全检索不到」这种结构性缺陷，
-但不足以支撑统计显著性结论。它是烟测基线，不是 benchmark；题目增删都会
-让数字跳动，写进 README 时必须同时标注题量。
+题目定义在 scripts/eval_set.py，与忠实度评估共用同一批题。样本量与随机基线
+（约 K / 切片数）会一起打印在报告里：题目少、语料薄的时候 Recall 必然顶到
+天花板，那种数字只能当烟测基线，不能当 benchmark。
 """
 
 from __future__ import annotations
@@ -35,48 +37,9 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-
-@dataclass(frozen=True)
-class EvalCase:
-    question: str
-    source: str
-    anchor: str
-    note: str = ""
-
-
-# 5 道题覆盖 docs/kb-core-design.md 的五个切片（简介 / 技术栈 / 部署 / Agent 架构 / 工程约束）
-EVAL_SET: list[EvalCase] = [
-    EvalCase(
-        question="这个系统的项目定位是什么？",
-        source="kb-core-design.md",
-        anchor="生产级的个人知识库问答 Agent",
-        note="第一章 项目简介",
-    ),
-    EvalCase(
-        question="后端 Web 框架为什么要求异步？",
-        source="kb-core-design.md",
-        anchor="FastAPI（要求异步，自动生成 OpenAPI 文档）",
-        note="第二章 技术栈",
-    ),
-    EvalCase(
-        question="这个项目怎么做部署和测试？",
-        source="kb-core-design.md",
-        anchor="Docker Compose 一键启动",
-        note="第二章 部署与测试",
-    ),
-    EvalCase(
-        question="SQL 子图里的 fetch_schema 节点为什么严禁硬编码表结构？",
-        source="kb-core-design.md",
-        anchor="动态读取当前数据库 schema",
-        note="第三章 六节点子图",
-    ),
-    EvalCase(
-        question="对话上下文只保留最近 N 轮是为了防止什么问题？",
-        source="kb-core-design.md",
-        anchor="防止上下文窗口爆炸",
-        note="第四章 工程约束",
-    ),
-]
+# 题目正文放在 scripts/eval_set.py：检索与忠实度两个维度必须用同一批题，
+# 否则「检索涨了、忠实度掉了」这类结论根本无从对比。
+from scripts.eval_set import EVAL_SET, EvalCase, by_topic  # noqa: E402
 
 DEFAULT_DEPTH = 5
 
@@ -135,16 +98,20 @@ def _fit(text: str, width: int) -> str:
 
 @dataclass
 class ArmResult:
-    """一条评分臂（向量粗召回 / 全链路）的逐题结果。"""
+    """一条评分臂（向量粗召回 / 全链路 / 线上配置）的逐题结果。"""
 
     name: str
+    # 这条臂最多能返回几条。线上臂只返回 3 条，给它算 Recall@5 是假的。
+    capacity: int = 0
     ranks: list[int] = field(default_factory=list)
     timings_ms: list[float] = field(default_factory=list)
 
     def summary(self, depths: list[int]) -> dict[str, Any]:
+        usable = [k for k in depths if not self.capacity or k <= self.capacity]
         return {
             "arm": self.name,
-            **{f"recall@{k}": round(recall_at(self.ranks, k), 4) for k in depths},
+            **{f"recall@{k}": round(recall_at(self.ranks, k), 4) for k in usable},
+            "depths": usable,
             "mrr": round(mrr(self.ranks), 4),
             "avg_ms": round(sum(self.timings_ms) / len(self.timings_ms), 1) if self.timings_ms else 0.0,
         }
@@ -164,7 +131,9 @@ async def _bootstrap() -> None:
         await ensure_index_ready(session, seed_demo=True)
 
 
-async def evaluate(*, depth: int, show_hits: bool) -> dict[str, Any]:
+async def evaluate(
+    *, depth: int, show_hits: bool, limit: int | None = None, top_n: int | None = None
+) -> dict[str, Any]:
     from sqlalchemy import func, select
 
     from app.core.config import get_settings
@@ -175,16 +144,24 @@ async def evaluate(*, depth: int, show_hits: bool) -> dict[str, Any]:
     from app.rag.vectorstore import current_collection_name, get_vector_store
 
     cfg = get_settings()
+    # 线上只把重排后的前 N 条塞进提示词，所以必须单独有一条「线上」臂：
+    # 用 top-5 算出的 MRR 会把排在第 4、5 位的命中算成 0.2、0.25，
+    # 而线上根本看不到这两条，那个数字是虚高的。
+    top_n = top_n or cfg.rag_rerank_top_n
+
     factory = get_session_factory()
     async with factory() as session:
         documents = await session.scalar(select(func.count()).select_from(Document)) or 0
     chunks = await get_vector_store().count()
 
-    vector_arm = ArmResult(name="向量粗召回")
-    full_arm = ArmResult(name="全链路(含重排)")
+    cases = EVAL_SET[:limit] if limit else list(EVAL_SET)
+
+    vector_arm = ArmResult(name="向量粗召回", capacity=depth)
+    full_arm = ArmResult(name=f"全链路 top-{depth}", capacity=depth)
+    prod_arm = ArmResult(name=f"线上 top-{top_n}", capacity=top_n)
     rows: list[dict[str, Any]] = []
 
-    for case in EVAL_SET:
+    for case in cases:
         started = time.perf_counter()
         vector_hits = await search_vectors(case.question, top_k=depth)
         vector_ms = (time.perf_counter() - started) * 1000
@@ -193,20 +170,29 @@ async def evaluate(*, depth: int, show_hits: bool) -> dict[str, Any]:
         full_hits = await retrieve(case.question, top_k=max(depth, cfg.rag_top_k), top_n=depth)
         full_ms = (time.perf_counter() - started) * 1000
 
+        prod_hits = full_hits[:top_n] if top_n <= depth else await retrieve(
+            case.question, top_k=cfg.rag_top_k, top_n=top_n
+        )
+
         rank_vector = first_relevant_rank(vector_hits, case)
         rank_full = first_relevant_rank(full_hits, case)
+        rank_prod = first_relevant_rank(prod_hits, case)
         vector_arm.ranks.append(rank_vector)
         full_arm.ranks.append(rank_full)
+        prod_arm.ranks.append(rank_prod)
         vector_arm.timings_ms.append(vector_ms)
         full_arm.timings_ms.append(full_ms)
+        prod_arm.timings_ms.append(full_ms)
 
         rows.append(
             {
                 "question": case.question,
+                "topic": case.topic,
                 "expected": case.anchor,
                 "note": case.note,
                 "rank_vector": rank_vector,
                 "rank_full": rank_full,
+                "rank_prod": rank_prod,
                 "vector_hits": [
                     {"source": _meta(h).get("source"), "score": round(h.score, 4)} for h in vector_hits
                 ],
@@ -222,6 +208,7 @@ async def evaluate(*, depth: int, show_hits: bool) -> dict[str, Any]:
             for label, hits, rank in (
                 ("向量", vector_hits, rank_vector),
                 ("全链路", full_hits, rank_full),
+                (f"线上 top-{top_n}", prod_hits, rank_prod),
             ):
                 print(f"   [{label}] 首个相关片段排名: {rank or '未命中'}")
                 for i, hit in enumerate(hits[:depth], start=1):
@@ -238,9 +225,17 @@ async def evaluate(*, depth: int, show_hits: bool) -> dict[str, Any]:
             "dim": get_embedder().dim,
             "collection": current_collection_name(),
         },
-        "questions": len(EVAL_SET),
+        "questions": len(cases),
+        "topics": by_topic(),
+        # 随机命中一条的概率 K/切片数；按线上取的前 N 条算，才是真实下限
+        "random_baseline_recall": round(min(1.0, top_n / chunks), 4) if chunks else 0.0,
         "depth": depth,
-        "arms": [vector_arm.summary(depths), full_arm.summary(depths)],
+        "top_n": top_n,
+        "arms": [
+            vector_arm.summary(depths),
+            full_arm.summary(depths),
+            prod_arm.summary(depths),
+        ],
         "rows": rows,
     }
 
@@ -249,7 +244,30 @@ def _mark(ok: bool) -> str:
     return "✅" if ok else "—"
 
 
-def _print_report(report: dict[str, Any], depths: list[int]) -> None:
+def topic_stats(rows: list[dict[str, Any]], depth: int) -> list[dict[str, Any]]:
+    """按分组汇总，41 题逐行打印没人看，分组表才看得出哪一类在退化。"""
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        groups.setdefault(row.get("topic") or "未分组", []).append(row)
+
+    stats: list[dict[str, Any]] = []
+    for topic, items in groups.items():
+        ranks_vector = [int(i["rank_vector"]) for i in items]
+        ranks_full = [int(i["rank_full"]) for i in items]
+        stats.append(
+            {
+                "topic": topic,
+                "n": len(items),
+                f"recall@{3}_vector": recall_at(ranks_vector, 3),
+                f"recall@{3}": recall_at(ranks_full, 3),
+                f"recall@{depth}": recall_at(ranks_full, depth),
+                "mrr": mrr(ranks_full),
+            }
+        )
+    return stats
+
+
+def _print_report(report: dict[str, Any], depths: list[int], show_rows: bool = False) -> None:
     corpus = report["corpus"]
     print("═" * 78)
     print("  RAG 检索质量评估")
@@ -259,32 +277,56 @@ def _print_report(report: dict[str, Any], depths: list[int]) -> None:
     print(f"  Collection: {corpus['collection']}")
     print(f"  题量      : {report['questions']}   召回深度: {report['depth']}")
     print("─" * 78)
-    header = (
-        "  " + _fit("#", 3) + _fit("问题", 33) + " "
-        + _fit("R@3向量", 9) + _fit("R@3全链", 9) + _fit("R@5全链", 9)
-        + "首次命中排名"
-    )
-    print(header)
-    print("─" * 78)
-    for index, row in enumerate(report["rows"], start=1):
-        rv, rf = row["rank_vector"], row["rank_full"]
-        line = (
-            "  " + _fit(str(index), 3) + _fit(row["question"], 33) + " "
-            + _fit(_mark(0 < rv <= 3), 9) + _fit(_mark(0 < rf <= 3), 9) + _fit(_mark(0 < rf <= 5), 9)
-            + f"向量#{rv or '-'} / 全链路#{rf or '-'}"
-        )
-        print(line)
 
-    print("─" * 78)
+    depth = int(report["depth"])
+    if show_rows:
+        header = (
+            "  " + _fit("#", 3) + _fit("问题", 33) + " "
+            + _fit("R@3向量", 9) + _fit("R@3全链", 9) + _fit(f"R@{depth}全链", 9)
+            + "首次命中排名"
+        )
+        print(header)
+        for index, row in enumerate(report["rows"], start=1):
+            rv, rf = row["rank_vector"], row["rank_full"]
+            line = (
+                "  " + _fit(str(index), 3) + _fit(row["question"], 33) + " "
+                + _fit(_mark(0 < rv <= 3), 9) + _fit(_mark(0 < rf <= 3), 9)
+                + _fit(_mark(0 < rf <= depth), 9)
+                + f"向量#{rv or '-'} / 全链路#{rf or '-'}"
+            )
+            print(line)
+        print("─" * 78)
+    else:
+        header = (
+            "  " + _fit("分组", 14) + _fit("题量", 6)
+            + _fit("R@3向量", 9) + _fit("R@3全链", 9) + _fit(f"R@{depth}全链", 10)
+            + "MRR全链"
+        )
+        print(header)
+        for stat in topic_stats(report["rows"], depth):
+            print(
+                "  " + _fit(stat["topic"], 14) + _fit(str(stat["n"]), 6)
+                + _fit(f"{stat['recall@3_vector']:.2f}", 9)
+                + _fit(f"{stat['recall@3']:.2f}", 9)
+                + _fit(f"{stat[f'recall@{depth}']:.2f}", 10)
+                + f"{stat['mrr']:.3f}"
+            )
+        print("─" * 78)
+
     for arm in report["arms"]:
-        parts = [f"Recall@{k}={arm[f'recall@{k}']:.2f}" for k in depths]
+        usable = arm.get("depths") or depths
+        parts = [f"Recall@{k}={arm[f'recall@{k}']:.2f}" for k in usable]
         print(
             "  " + _fit(arm["arm"], 18)
             + "  ".join(parts)
             + f"  MRR={arm['mrr']:.3f}  {arm['avg_ms']:.0f}ms/题"
         )
     print("═" * 78)
-    print("  注：5 题 / 9 切片属烟测基线，Recall 容易顶到天花板；MRR 更能反映重排的作用。")
+    print(
+        f"  注：{report['questions']} 题 / {corpus['chunks']} 切片，"
+        f"随机命中基线约 Recall@{report['top_n']}={report['random_baseline_recall']:.2f}；"
+        "题目与语料同源，绝对值只用于回归对比。"
+    )
     print()
 
 
@@ -293,6 +335,8 @@ async def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--top-k", type=int, default=DEFAULT_DEPTH, help="召回深度（默认 5）")
     parser.add_argument("--json", action="store_true", help="只输出 JSON，不打印表格")
     parser.add_argument("--show-hits", action="store_true", help="打印每题命中的片段")
+    parser.add_argument("--rows", action="store_true", help="逐题打印，而不是只打分组汇总")
+    parser.add_argument("--limit", type=int, default=None, help="只跑前 N 题")
     parser.add_argument(
         "--min-recall",
         type=float,
@@ -304,20 +348,21 @@ async def main(argv: list[str] | None = None) -> int:
 
     started = time.perf_counter()
     await _bootstrap()
-    report = await evaluate(depth=args.top_k, show_hits=args.show_hits)
+    report = await evaluate(depth=args.top_k, show_hits=args.show_hits, limit=args.limit)
     elapsed = (time.perf_counter() - started) * 1000
 
     depths = sorted({3, 5, args.top_k})
     if args.json:
         print(json.dumps({**report, "elapsed_ms": round(elapsed)}, ensure_ascii=False, indent=2))
     else:
-        _print_report(report, depths)
+        _print_report(report, depths, show_rows=args.rows)
         print(f"  耗时 {elapsed:.0f} ms")
 
     if args.min_recall is not None:
-        full = next(a for a in report["arms"] if a["arm"].startswith("全链路"))
-        if full["recall@3"] < args.min_recall:
-            print(f"  ✗ Recall@3={full['recall@3']:.2f} 低于阈值 {args.min_recall:.2f}")
+        # 用「线上」这条臂判定：它才是用户真正拿到的东西
+        prod = next(a for a in report["arms"] if a["arm"].startswith("线上"))
+        if prod["recall@3"] < args.min_recall:
+            print(f"  ✗ 线上 Recall@3={prod['recall@3']:.2f} 低于阈值 {args.min_recall:.2f}")
             return 1
     return 0
 
