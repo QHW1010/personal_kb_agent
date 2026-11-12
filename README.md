@@ -59,10 +59,10 @@ flowchart TB
     end
 
     subgraph Graph["LangGraph StateGraph"]
-        RT[route<br/>greeting→direct<br/>聚合→sql<br/>其余→rag]
+        RT[intent_router<br/>寒暄直判 / LLM 分类 / 规则兜底]
         RV[retrieve<br/>向量召回 + 重排]
-        SQ[sql<br/>NL→SQL→只读校验→执行]
-        CP[compose<br/>LLM 生成]
+        SQ[sql_builder<br/>NL→SQL→只读校验→执行]
+        SY[synthesize<br/>LLM 流式生成]
         DR[direct]
     end
 
@@ -77,16 +77,16 @@ flowchart TB
         RD[(Redis<br/>可选，自动降级内存)]
     end
 
-    LLM[Chat Model<br/>offline / OpenAI]
+    LLM[Chat Model<br/>DeepSeek / OpenAI 兼容<br/>offline 兜底]
 
     C --> R1 --> AUTH --> PG
     C --> R2 --> AUTH --> RL --> RT
-    RT -->|rag| RV --> EM --> VS --> RR --> CP
-    RT -->|sql| SQ --> PG --> CP
+    RT -->|rag| RV --> EM --> VS --> RR --> SY
+    RT -->|sql| SQ --> PG --> SY
     RT -->|direct| DR
-    CP --> LLM
-    CP --> V[Pydantic AgentAnswer 校验]
-    V --> SSE[SSE: token… → done]
+    SY --> LLM
+    SY --> V[Pydantic AgentAnswer 校验]
+    V --> SSE[SSE: route → citations → token… → done]
     SSE --> C
     R3 --> EM --> VS
     R3 --> PG
@@ -96,15 +96,17 @@ flowchart TB
 **请求时序（RAG 路线）**
 
 ```
-client ──POST /chat──▶ auth ─▶ rate limit ─▶ load last N turns ─▶ route
-                                                                  │
-                        ┌─────────────────────────────────────────┘
+client ──POST /chat──▶ auth ─▶ 限流 ─▶ 读最近 N 轮 ─▶ intent_router
+                                                        │  route 事件
+                        ┌───────────────────────────────┘
                         ▼
-              retrieve → rerank → 组装 context  → LLM 流式生成
-                        │                         │
-                        │                         ├─ token 事件逐个下发 ─▶ client
-                        ▼                         ▼
-                    citations ─────────────▶ AgentAnswer 校验 ─▶ 落库 + 计费 ─▶ done 事件
+              retrieve → rerank → 组装 context ──▶ citations 事件
+                        │
+                        ▼
+              synthesize（LLM 流式）── token 事件逐个下发 ──▶ client
+                        │
+                        ▼
+              AgentAnswer 校验 ─▶ 落库 + 计费 ─▶ done 事件（含 citations）
 ```
 
 ---
@@ -114,7 +116,8 @@ client ──POST /chat──▶ auth ─▶ rate limit ─▶ load last N turns
 | 层 | 选型 | 备注 |
 |---|---|---|
 | Web | FastAPI（异步）+ Uvicorn | 自动 OpenAPI，`/docs` 可直接调试 |
-| Agent 编排 | LangGraph `StateGraph` | 条件边路由，节点职责单一 |
+| Agent 编排 | LangGraph `StateGraph` | 条件边路由，节点职责单一；`intent_router`/`retrieve`/`synthesize` |
+| LLM | DeepSeek `deepseek-chat`（OpenAI 协议） | 换网关只改 `OPENAI_BASE_URL`；`LLM_PROVIDER=fake` 时走离线确定性模型 |
 | RAG | 向量召回 + 重排 | Embedding / 向量库 / Reranker 三层可替换 |
 | Embedding | fastembed（ONNX）+ `BAAI/bge-small-zh-v1.5` | 512 维，权重约 90MB，走 hf-mirror；不依赖 torch |
 | 向量库 | Chroma（默认） | 集合名按模型维度版本化；装不上自动降级进程内实现 |
@@ -172,12 +175,35 @@ uvicorn app.main:app --reload --port 8000
 > 完全离线或 CI 环境可把 `.env` 里的 `EMBEDDING_PROVIDER` 设成 `hashing`（零依赖、非语义），
 > 或 `VECTOR_BACKEND=memory` 走进程内向量库 —— 两条降级路径都不需要联网。
 
-想用真实大模型：
+接真实大模型（DeepSeek / 通义 / vLLM / Azure，只要兼容 OpenAI 协议）：
 
 ```bash
 pip install -r requirements-llm.txt
-# .env 里设置 LLM_PROVIDER=openai、LLM_API_KEY=sk-xxx
 ```
+
+然后在 `.env` 里填：
+
+```dotenv
+LLM_PROVIDER=openai
+OPENAI_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+OPENAI_BASE_URL=https://api.deepseek.com/v1
+MODEL_NAME=deepseek-chat
+```
+
+> Key 只写进 `.env`（已被 `.gitignore` 排除），`.env.example` 里只有占位符。
+> 换成 DeepSeek 后记得同步 `PRICE_PROMPT_PER_1K` / `PRICE_COMPLETION_PER_1K`，
+> 否则用量台账里的美元数字是 OpenAI 的价格。
+
+### 端到端验证（真实流式）
+
+```bash
+python -m scripts.e2e_chat
+python -m scripts.e2e_chat "知识库里一共有多少篇文档？"
+python -m scripts.e2e_chat --base-url http://127.0.0.1:8000   # 打已启动的服务
+```
+
+脚本跑的是完整链路：ASGI/HTTP → JWT → chat_service → LangGraph → DeepSeek → SSE，
+逐帧解析并断言"真的流式、真的有引用"，任一断言不过就以非 0 退出。
 
 ### 冒烟验证
 
@@ -359,13 +385,19 @@ curl -X POST http://localhost:8000/api/v1/knowledge/ingest \
 
 ```
 event: start
-data: {"conversation_id":"0b9c...","model":"offline-deterministic"}
+data: {"conversation_id":"0b9c...","model":"deepseek-chat"}
+
+event: route
+data: {"route":"rag","source":"llm","reason":"询问设计原因需查文档"}
+
+event: citations
+data: {"citations":[{"source":"kb-core-design.md","paragraph_index":10,"char_start":968,"char_end":1342,"score":0.4356}]}
 
 event: token
-data: {"t":"围绕「重排序是怎么工作的？」，知识库中"}
+data: {"t":"禁止在 SQL 提示词里硬编码 LIMIT，"}
 
 event: token
-data: {"t":"《RAG 链路说明》给出了以下要点："}
+data: {"t":"是为了避免多行答案被截断。"}
 
 event: done
 data: {"conversation_id":"0b9c...","message_id":"4d1e...","answer":"...","route":"rag","citations":[...],"usage":{...}}
@@ -374,12 +406,18 @@ data: {"conversation_id":"0b9c...","message_id":"4d1e...","answer":"...","route"
 | 事件 | 时机 | 载荷 |
 |---|---|---|
 | `start` | 流开始 | `conversation_id`, `model` |
+| `route` | 意图确定后、正文之前 | `route`, `source`(`llm`/`fast_rule`/`fallback`), `reason` |
+| `citations` | 检索完成、正文之前 | `citations[]`（来源、段落号、字符区间、分数） |
 | `token` | 每个增量 | `{"t": "文本片段"}` |
 | `done` | 正常结束 | 完整 `ChatResponse`（含引用、SQL、rows、usage） |
 | `error` | 异常 | `{"code","message"}`，客户端应停止拼接 |
 
 前端对接要点：`done` 覆盖所有结构化字段，`token` 只用于实时打字效果；
 若中途收到 `error`，丢弃已拼接内容并提示重试。
+
+`route` 与 `citations` 都在第一个 `token` 之前到达，所以界面可以先把
+"走的是哪条链路"和"依据了哪几个文档段落"渲染出来，再流式填正文。
+`source=llm` 表示意图由模型判定，`fast_rule` 是寒暄直判，`fallback` 是模型不可用后回落规则。
 
 ---
 
@@ -403,7 +441,12 @@ data: {"conversation_id":"0b9c...","message_id":"4d1e...","answer":"...","route"
 | `RAG_CHUNK_SIZE` / `RAG_CHUNK_OVERLAP` | `400` / `60` | 块长与重叠，需给 512 token 留余量 |
 | `RAG_MODEL_LOAD_TIMEOUT_SECONDS` | `600` | 首次下载模型用，**不能**复用 `TOOL_TIMEOUT_SECONDS` |
 | `SEED_DEMO_DOCS` | `true` | 启动时灌 4 篇演示语料；只想看自己 `docs/` 的内容就设 `false` |
-| `LLM_PROVIDER` | `fake` | `fake` = 离线确定性；`openai` = 真实模型 |
+| `LLM_PROVIDER` | `fake` | `fake` = 离线确定性；`openai` = 任何 OpenAI 兼容网关（DeepSeek 用这个） |
+| `MODEL_NAME` / `LLM_MODEL` | `deepseek-chat` | 两种写法都认；DeepSeek 官方示例用 `MODEL_NAME` |
+| `OPENAI_API_KEY` / `LLM_API_KEY` | 空 | 真实模型的 Key，**只写在 `.env` 里，`.env` 已被 gitignore** |
+| `OPENAI_BASE_URL` / `LLM_BASE_URL` | 空 | DeepSeek 填 `https://api.deepseek.com/v1` |
+| `LLM_TIMEOUT_SECONDS` | `90` | 正文生成超时；复用 `TOOL_TIMEOUT_SECONDS`(10s) 会掐断长答案 |
+| `LLM_INTENT_TIMEOUT_SECONDS` | `20` | 意图分类是短任务，超时就回落规则路由 |
 | `HISTORY_MAX_TURNS` | `6` | 上下文窗口（轮），防止成本失控 |
 | `TOOL_TIMEOUT_SECONDS` / `TOOL_MAX_RETRIES` | `10` / `2` | 外部 I/O 超时与重试 |
 | `RATE_LIMIT_PER_MINUTE` | `30` | 每用户每分钟请求上限 |
@@ -423,9 +466,9 @@ personal_kb_agent/
 │   │   └── v1/               # health / auth / chat / knowledge
 │   ├── agents/               # 编排层（不碰 HTTP，不碰 SQL 细节）
 │   │   ├── graph.py          # StateGraph 拓扑
-│   │   ├── nodes.py          # route / retrieve / sql / compose / direct
+│   │   ├── nodes.py          # intent_router / retrieve / sql / synthesize / direct
 │   │   ├── state.py          # AgentState
-│   │   ├── llm.py            # offline / openai 模型工厂
+│   │   ├── llm.py            # DeepSeek(OpenAI 协议) / offline 模型工厂 + 预热
 │   │   └── prompts.py        # 提示词（SQL 提示词刻意不含 LIMIT）
 │   ├── rag/                  # 检索层
 │   │   ├── chunking.py       # 结构感知切分（标题/代码块/表格 + 字符偏移）
@@ -443,10 +486,11 @@ personal_kb_agent/
 │   └── services/             # chat_service / usage
 ├── alembic/                  # 迁移脚本
 ├── docs/                     # 知识库语料（Markdown / TXT）
-├── tests/                    # pytest（认证/RAG/NL2SQL/SSE/切分/引用）
+├── tests/                    # pytest（认证/RAG/NL2SQL/SSE/切分/引用/编排）
 ├── scripts/
 │   ├── ingest.py             # 摄入 docs/，打印生效配置与切块统计
 │   ├── test_retrieval.py     # 单问句检索验证（分数 / 来源 / 偏移校验）
+│   ├── e2e_chat.py           # 端到端真实问答（LangGraph → DeepSeek → SSE）
 │   └── seed_demo.py          # 手动灌演示语料
 ├── Dockerfile
 └── docker-compose.yml
@@ -486,6 +530,18 @@ personal_kb_agent/
    加上构造时的维度守卫和写入前校验，冲突在启动期就炸出来，而不是等线上发现召回率掉了。
 10. **为什么 chunk_id 用 `sha1(document_id|index|text)` 而不是 uuid4？** 相同内容必须落同一个 id，
     否则重跑一次摄入就是一份重复数据。确定性 id + `upsert` 让摄入天然幂等，`--force` 才需要先删。
+11. **意图路由为什么让模型判断，而不是纯正则？** 规则只认字面（"多少" + "文档"），
+    问"文档里有几种检索策略，区别是什么"会被误判成 SQL。真实模型能读懂意图，
+    但会超时、会返回脏格式，所以做成**级联**：寒暄正则直判（零成本）→ 模型分类（默认路径）
+    → 规则兜底。三层都在同一个节点里，路由永远不会"无解"。
+12. **为什么不能用"薄封装"包一层 OpenAI SDK？** LangGraph 的 `stream_mode="messages"`
+    靠 `BaseChatModel` 的流式回调工作。早期实现里有个只转发 `astream` 的普通 Python 对象，
+    看着能跑，实际一个 token 都推不出去 —— 客户端会等整段答案生成完才收到响应。
+    现在直接返回 `ChatOpenAI`，它本身就是 `BaseChatModel`。
+13. **为什么要把 LLM 预热放在启动期？** 首次构造 `ChatOpenAI` 要 8 秒左右
+    （`import langchain_openai` 4.7s + openai SDK 客户端初始化 3.5s + tiktoken 词典下载 4.7s），
+    这段成本放在第一个用户请求上，TTFT 会从 2.4 秒变成 9 秒。启动期打一次 1-token 请求，
+    用户侧就只剩推理时间；顺带把 tiktoken 缓存固定到 `./data/tiktoken`，容器重启不必重下。
 
 ---
 
@@ -509,6 +565,7 @@ RUN_FASTEMBED_IT=1 pytest -m integration   # 真跑一次 ONNX 模型
 | `test_fastembed_branch.py` | 注入式假模型不下载、前缀生效、缺包报错、未知模型报错 |
 | `test_index_bootstrap.py` | `SEED_DEMO_DOCS` 开关、重复启动不重复灌语料、旧调用点兼容 |
 | `test_chat.py` | 路由分类、RAG 带引用、NL2SQL 返回正确行、SSE 事件流、会话续接、`top_k` 透传 |
+| `test_orchestration.py` | LLM 意图路由与回落、脏输出解析、真实 usage 入账、引用标记清理、SSE 事件顺序 |
 | `test_guards.py` | 只读 SQL 校验、空答案拒绝、`route=sql` 必须带 SQL、提示词无 LIMIT |
 | `test_usage.py` | token 估算、成本计算、台账累计、上下文窗口上限、限流 |
 | `test_health.py` | 健康检查、存活探针、`/docs` 与 OpenAPI 可用 |
