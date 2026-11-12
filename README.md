@@ -13,6 +13,7 @@
 - [架构](#架构)
 - [技术栈](#技术栈)
 - [快速开始](#快速开始)
+- [文档摄入与检索验证](#文档摄入与检索验证)
 - [接口示例](#接口示例)
 - [SSE 事件协议](#sse-事件协议)
 - [环境变量](#环境变量)
@@ -115,7 +116,8 @@ client ──POST /chat──▶ auth ─▶ rate limit ─▶ load last N turns
 | Web | FastAPI（异步）+ Uvicorn | 自动 OpenAPI，`/docs` 可直接调试 |
 | Agent 编排 | LangGraph `StateGraph` | 条件边路由，节点职责单一 |
 | RAG | 向量召回 + 重排 | Embedding / 向量库 / Reranker 三层可替换 |
-| 向量库 | Chroma（默认） | 装不上或缺依赖时自动降级为进程内实现 |
+| Embedding | fastembed（ONNX）+ `BAAI/bge-small-zh-v1.5` | 512 维，权重约 90MB，走 hf-mirror；不依赖 torch |
+| 向量库 | Chroma（默认） | 集合名按模型维度版本化；装不上自动降级进程内实现 |
 | 关系库 | PostgreSQL + SQLAlchemy 2.0 | 异步驱动 asyncpg；本地默认 SQLite |
 | 迁移 | Alembic | `alembic upgrade head` |
 | 缓存/限流 | Redis | 连不上自动降级内存，`/health` 会标 degraded |
@@ -159,9 +161,16 @@ source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
 
-# 启动（默认 SQLite + 内存向量库 + 离线模型，无需任何外部依赖）
+# 首次运行会把 bge-small-zh 的 ONNX 权重（约 90MB）下到 ./data/models
+# 走 hf-mirror.com 镜像，国内网络通常 30 秒内完成
+python -m scripts.ingest
+
+# 启动（默认 SQLite + Chroma + fastembed 真实语义向量）
 uvicorn app.main:app --reload --port 8000
 ```
+
+> 完全离线或 CI 环境可把 `.env` 里的 `EMBEDDING_PROVIDER` 设成 `hashing`（零依赖、非语义），
+> 或 `VECTOR_BACKEND=memory` 走进程内向量库 —— 两条降级路径都不需要联网。
 
 想用真实大模型：
 
@@ -184,6 +193,76 @@ curl -N -X POST http://localhost:8000/api/v1/chat \
   -H "Content-Type: application/json" \
   -d '{"message":"重排序是怎么工作的？","stream":true}'
 ```
+
+---
+
+## 文档摄入与检索验证
+
+`docs/` 下的 Markdown / 纯文本会被切块写入 Chroma，检索命中时会带上**来源文件名、段落号、
+字符区间、章节路径**四项元数据，可以精确回原文定位。
+
+### 摄入
+
+```bash
+python -m scripts.ingest                     # 增量（已入库的跳过）
+python -m scripts.ingest --force             # 强制重建（覆盖同名 source）
+python -m scripts.ingest --dry-run           # 只看切块结果，不写库
+python -m scripts.ingest --pattern "*.md"    # 只摄入匹配文件
+```
+
+脚本启动时会先打印本次实际生效的配置，避免"改了半天 .env 其实没读到"：
+
+```
+Embedder  : fastembed / BAAI/bge-small-zh-v1.5 (dim=512)
+Collection: kb_documents_fastembed_baai_bge_small_zh_v1_5_512
+Backend   : chroma
+Chunk     : size=400 overlap=60
+[1/1] kb-core-design.md  ok  title='...' chunks=5 elapsed=1.2s
+汇总: 新增 1 篇 / 跳过 0 / 失败 0
+本次新增切片 5 | 向量库总数 9 | 台账切片 9
+```
+
+单篇失败不会中断整批；结束时若"向量库条数"与"数据库台账条数"不一致，会自动触发重建并说明原因。
+
+> 服务启动时还会灌 4 篇演示语料（`RAG 链路说明` / `SQL 查询能力` 等），让新 clone 的仓库
+> 零配置就能问出东西。只想看到自己的文档时把 `SEED_DEMO_DOCS` 设为 `false`。
+
+### 检索验证
+
+```bash
+python -m scripts.test_retrieval "不可违反的工程约束有哪几条？"
+python -m scripts.test_retrieval --top-k 10 --top-n 5 --no-rerank "重排序怎么做"
+python -m scripts.test_retrieval --verify "SQL 为什么禁用硬编码 LIMIT"   # 回查原文偏移
+```
+
+输出（真实运行结果）：
+
+```
+#1  rerank=0.6034  vector=0.6388  text
+    source : kb-core-design.md
+    title  : Personal KB Agent 个人知识库问答系统核心设计文档
+    section: Personal KB Agent 个人知识库问答系统核心设计文档 > 四、不可违反的工程约束
+    para   : #10   chars=[968,1342)  len=374
+    偏移校验: ✅ content[char_start:char_end] == 切片文本
+    preview: ## 四、不可违反的工程约束 1. **强制输出校验**：所有 Agent 的输出必须经过...
+```
+
+同时给出 `rerank`（融合分，最终排序依据）与 `vector`（余弦相似度）两个分数：
+两者不一致的条目正是重排起作用的地方。`--verify` 会拿 `char_start/char_end` 回查数据库原文，
+校验"落库时记的偏移"与"当时切的文本"完全一致 —— 这是引用能高亮的前提。
+
+### 切分策略
+
+按**结构**切，不按固定字数暴力切：
+
+- Markdown 标题、围栏代码块、表格各自成块，代码块和表格不会被拦腰截断，`kind` 一并入库（`text` / `code` / `table`）；
+- 超长块走滑窗，但若已在新行断开就不再叠加 overlap（避免产生 50 字左右的碎片）；
+- 窗口起点前移到最近的句子边界（`\n。！？；`），不会出现从半个词开始的切片；
+- 纯标题块并入紧随其后的正文块 —— 否则检索会命中一个只有 13 字标题的"幽灵片段"；
+- 强制不变量：`content[char_start:char_end] == chunk.text`，由测试守护。
+
+块长默认 400 字符、重叠 60。`bge-small-zh-v1.5` 上下文 512 token，中文接近 1 字 1 token，
+留出的余量是为了避免 tokenizer 静默截断尾部。
 
 ---
 
@@ -315,8 +394,15 @@ data: {"conversation_id":"0b9c...","message_id":"4d1e...","answer":"...","route"
 | `AUTO_CREATE_TABLES` | `true` | 生产设 `false`，改用 Alembic |
 | `REDIS_URL` | 空 | 留空 = 进程内存缓存 |
 | `VECTOR_BACKEND` | `auto` | `auto` / `chroma` / `memory` |
-| `EMBEDDING_PROVIDER` | `hashing` | 切 `sentence-transformers` 需额外装包 |
+| `CHROMA_COLLECTION` | `kb_documents` | 基础名；fastembed 会派生带模型维度的后缀 |
+| `EMBEDDING_PROVIDER` | `fastembed` | `hashing` 零依赖兜底 / `fastembed` ONNX / `sentence-transformers` 需 torch |
+| `EMBEDDING_MODEL` | `BAAI/bge-small-zh-v1.5` | 中文小模型，512 维，权重约 90MB |
+| `HF_ENDPOINT` | `https://hf-mirror.com` | 国内镜像；代码里也会 `setdefault`，双保险 |
+| `FASTEMBED_CACHE_DIR` | `./data/models` | 权重落地目录，Compose 下挂卷复用 |
 | `RAG_TOP_K` / `RAG_RERANK_TOP_N` | `8` / `3` | 粗召回条数 / 精排保留条数 |
+| `RAG_CHUNK_SIZE` / `RAG_CHUNK_OVERLAP` | `400` / `60` | 块长与重叠，需给 512 token 留余量 |
+| `RAG_MODEL_LOAD_TIMEOUT_SECONDS` | `600` | 首次下载模型用，**不能**复用 `TOOL_TIMEOUT_SECONDS` |
+| `SEED_DEMO_DOCS` | `true` | 启动时灌 4 篇演示语料；只想看自己 `docs/` 的内容就设 `false` |
 | `LLM_PROVIDER` | `fake` | `fake` = 离线确定性；`openai` = 真实模型 |
 | `HISTORY_MAX_TURNS` | `6` | 上下文窗口（轮），防止成本失控 |
 | `TOOL_TIMEOUT_SECONDS` / `TOOL_MAX_RETRIES` | `10` / `2` | 外部 I/O 超时与重试 |
@@ -342,11 +428,12 @@ personal_kb_agent/
 │   │   ├── llm.py            # offline / openai 模型工厂
 │   │   └── prompts.py        # 提示词（SQL 提示词刻意不含 LIMIT）
 │   ├── rag/                  # 检索层
-│   │   ├── embeddings.py     # hashing / sentence-transformers
-│   │   ├── vectorstore.py    # Chroma / memory
+│   │   ├── chunking.py       # 结构感知切分（标题/代码块/表格 + 字符偏移）
+│   │   ├── embeddings.py     # fastembed / hashing / sentence-transformers
+│   │   ├── vectorstore.py    # Chroma / memory（集合按模型维度版本化）
 │   │   ├── reranker.py       # lexical / cross-encoder
-│   │   ├── retriever.py      # 召回 → 重排 → 引用
-│   │   └── ingest.py         # 切块入库 + 演示语料
+│   │   ├── retriever.py      # 召回 → 重排 → 带偏移的引用
+│   │   └── ingest.py         # 遍历 docs/ → 切块 → upsert → 台账
 │   ├── core/                 # 横切关注点
 │   │   ├── config.py errors.py security.py
 │   │   ├── resilience.py     # 超时 + 重试
@@ -355,8 +442,12 @@ personal_kb_agent/
 │   ├── schemas/              # auth / chat / agent（输出校验闸门）
 │   └── services/             # chat_service / usage
 ├── alembic/                  # 迁移脚本
-├── tests/                    # pytest（认证/RAG/NL2SQL/SSE/守卫）
-├── scripts/seed_demo.py      # 手动灌语料
+├── docs/                     # 知识库语料（Markdown / TXT）
+├── tests/                    # pytest（认证/RAG/NL2SQL/SSE/切分/引用）
+├── scripts/
+│   ├── ingest.py             # 摄入 docs/，打印生效配置与切块统计
+│   ├── test_retrieval.py     # 单问句检索验证（分数 / 来源 / 偏移校验）
+│   └── seed_demo.py          # 手动灌演示语料
 ├── Dockerfile
 └── docker-compose.yml
 ```
@@ -384,15 +475,27 @@ personal_kb_agent/
    降级让"跑不起来"变成"跑得慢一点"，同时 `/health` 会如实报告当前后端。
 6. **为什么不用 passlib？** passlib 1.7.4 读取 `bcrypt.__about__` 在 bcrypt>=4.1 上会崩。
    直接调 `bcrypt` 三行代码，省掉一个长期踩坑源。
+7. **为什么用 fastembed（ONNX）而不是 sentence-transformers？** 后者拖整条 torch 依赖链，
+   冷装动辄几百 MB、十几分钟；fastembed 只复用 `onnxruntime`，同一个 `bge-small-zh-v1.5`
+   在 512 维下语义效果一致，`pip check` 也不会带进 transformers 的版本冲突。
+8. **为什么切分按结构而不是按字数？** 固定窗口会把代码块和表格拦腰切断，检索出来是一段无法阅读的残片。
+   这里用 Markdown 标题 / 围栏 / 表格作硬边界，只在块内超长时才滑窗，并且保证
+   `content[char_start:char_end] == chunk.text` —— 这条不变量让"引用回原文高亮"从愿望变成事实。
+9. **为什么集合名要带模型名和维度？** 换 embedding 模型就换了向量空间，往旧集合里塞新向量不会报错，
+   只会让检索结果悄悄变差（384 维 vs 512 维）。集合名内嵌 `provider_model_dim`，
+   加上构造时的维度守卫和写入前校验，冲突在启动期就炸出来，而不是等线上发现召回率掉了。
+10. **为什么 chunk_id 用 `sha1(document_id|index|text)` 而不是 uuid4？** 相同内容必须落同一个 id，
+    否则重跑一次摄入就是一份重复数据。确定性 id + `upsert` 让摄入天然幂等，`--force` 才需要先删。
 
 ---
 
 ## 测试
 
 ```bash
-pytest                # 全量
+pytest                # 全量（含 1 例需真实模型的 integration，默认跳过）
 pytest -q tests/test_chat.py
 pytest --cov=app      # 需 pip install pytest-cov
+RUN_FASTEMBED_IT=1 pytest -m integration   # 真跑一次 ONNX 模型
 ```
 
 覆盖范围：
@@ -401,7 +504,11 @@ pytest --cov=app      # 需 pip install pytest-cov
 |---|---|
 | `test_auth.py` | 注册/登录/重复邮箱/错误密码/JWT 往返/超长密码 |
 | `test_rag.py` | 切块、分词、embedding 确定性、重排顺序、入库后可检索、引用结构 |
-| `test_chat.py` | 路由分类、RAG 带引用、NL2SQL 返回正确行、SSE 事件流、会话续接 |
+| `test_chunking.py` | 偏移不变量、代码块/表格不被切断、章节路径、段落号单调、确定性 id、标题必带正文 |
+| `test_citation_meta.py` | 旧 payload 反序列化、新元数据字段、去重、脏元数据容错 |
+| `test_fastembed_branch.py` | 注入式假模型不下载、前缀生效、缺包报错、未知模型报错 |
+| `test_index_bootstrap.py` | `SEED_DEMO_DOCS` 开关、重复启动不重复灌语料、旧调用点兼容 |
+| `test_chat.py` | 路由分类、RAG 带引用、NL2SQL 返回正确行、SSE 事件流、会话续接、`top_k` 透传 |
 | `test_guards.py` | 只读 SQL 校验、空答案拒绝、`route=sql` 必须带 SQL、提示词无 LIMIT |
 | `test_usage.py` | token 估算、成本计算、台账累计、上下文窗口上限、限流 |
 | `test_health.py` | 健康检查、存活探针、`/docs` 与 OpenAPI 可用 |

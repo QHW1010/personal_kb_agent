@@ -18,6 +18,9 @@ langchain-core>=0.3.25,<0.4
 # ---- RAG ----
 chromadb>=0.5.20,<0.7
 numpy>=1.26,<2.0
+# ONNX 推理的真实语义 embedding：复用 onnxruntime，不拉 torch（省 200MB+ 与 20 分钟安装）
+# 注意：它会把 huggingface-hub 约束到 <2.0，tokenizers/chromadb 已兼容
+fastembed>=0.9,<0.10
 
 # ---- SQL / 持久化 ----
 SQLAlchemy[asyncio]>=2.0.35,<2.1

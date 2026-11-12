@@ -7,6 +7,8 @@
 #   LLM_BASE_URL=            # 走 Azure / 兼容网关时填写
 langchain-openai>=0.2.10,<0.4
 
-# 可选：更强的 embedding 与重排序模型（首次运行会下载权重）
-# 安装后设置 EMBEDDING_PROVIDER=sentence-transformers / RERANKER=cross-encoder
-sentence-transformers>=3.2,<4.0
+# 注意：embedding 已改用 fastembed（见 requirements.txt），不再需要 torch。
+# 只有在必须回到 sentence-transformers 路线时才装下面这个（约 +800MB）：
+#   pip install "sentence-transformers>=3.2,<4.0"
+# 并设置 EMBEDDING_PROVIDER=sentence-transformers
+# 重排序若要用 cross-encoder，同样需要 sentence-transformers，并设置 RERANKER=cross-encoder

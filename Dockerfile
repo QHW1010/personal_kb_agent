@@ -23,7 +23,12 @@ FROM python:3.11-slim AS runtime
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app \
-    PORT=8000
+    PORT=8000 \
+    # 模型权重走国内镜像；huggingface.co 在无外网环境下不可达
+    HF_ENDPOINT=https://hf-mirror.com \
+    HF_HUB_DISABLE_XET=1 \
+    FASTEMBED_CACHE_DIR=/app/data/models \
+    HF_HOME=/app/data/hf
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl \
@@ -37,9 +42,10 @@ COPY alembic.ini ./
 COPY alembic ./alembic
 COPY app ./app
 COPY scripts ./scripts
+COPY docs ./docs
 
 RUN useradd --create-home --shell /bin/bash appuser \
-    && mkdir -p /app/data/chroma \
+    && mkdir -p /app/data/chroma /app/data/models /app/data/hf \
     && chown -R appuser:appuser /app
 
 USER appuser

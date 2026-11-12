@@ -13,6 +13,8 @@ data/*.db
 data/*.sqlite3
 data/memory_store.json
 data/chroma/
+data/models/
+data/hf/
 data/uploads/
 !data/.gitkeep
 
