@@ -16,7 +16,9 @@ def configure_logging() -> None:
     if _CONFIGURED:
         return
     cfg = get_settings()
-    handler = logging.StreamHandler(sys.stdout)
+    # 日志走 stderr，stdout 留给结构化输出。评估脚本的 --json 要能被 jq / CI 直接消费，
+    # 日志混进 stdout 会把整份 JSON 变成非法输入（每行前面多一条时间戳）。
+    handler = logging.StreamHandler(sys.stderr)
     handler.setFormatter(logging.Formatter(_FORMAT, datefmt="%Y-%m-%dT%H:%M:%S"))
     root = logging.getLogger()
     root.handlers = [handler]
