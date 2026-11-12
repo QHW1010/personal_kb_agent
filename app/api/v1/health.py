@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agents.llm import describe_llm
 from app.core.cache import get_cache
 from app.core.config import get_settings
 from app.core.logging import get_logger
@@ -45,7 +46,13 @@ async def health(session: AsyncSession = Depends(get_session)) -> dict[str, Any]
     except Exception as exc:  # noqa: BLE001
         checks["cache"] = f"degraded: {type(exc).__name__}"
 
-    checks["llm"] = cfg.llm_provider
+    # 只报"配没配"，不回显 Key；模型名与网关地址对排障很有用，可以放
+    llm_info = describe_llm()
+    checks["llm"] = (
+        f"ok ({llm_info['model']} via {llm_info['base_url'] or 'default'})"
+        if llm_info["provider"] == "openai" and llm_info["api_key_configured"]
+        else f"{llm_info['provider']} ({llm_info['model']})"
+    )
 
     return {
         "status": "ok" if started_ok else "degraded",
@@ -53,6 +60,7 @@ async def health(session: AsyncSession = Depends(get_session)) -> dict[str, Any]
         "version": cfg.app_version,
         "env": cfg.env,
         "checks": checks,
+        "llm": llm_info,
     }
 
 

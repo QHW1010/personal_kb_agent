@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from httpx import AsyncClient
 
+from app.core.config import get_settings
+
 
 async def test_health_reports_dependencies(client: AsyncClient) -> None:
     resp = await client.get("/health")
@@ -12,7 +14,15 @@ async def test_health_reports_dependencies(client: AsyncClient) -> None:
     assert body["status"] == "ok"
     assert body["checks"]["database"] == "ok"
     assert "vectorstore" in body["checks"]
-    assert body["checks"]["llm"] == "fake"
+    # 测试环境强制 LLM_PROVIDER=fake：报 provider 与模型名，但不允许回显 Key
+    assert body["checks"]["llm"].startswith("fake")
+    assert body["llm"]["provider"] == "fake"
+    assert body["llm"]["model"] == "offline-deterministic"
+    assert "api_key_configured" in body["llm"]
+    raw = resp.text
+    secret = get_settings().llm_api_key
+    assert not secret or secret not in raw, "健康检查绝不能回显 API Key 明文"
+    assert "sk-" not in raw
 
 
 async def test_liveness_does_not_touch_dependencies(client: AsyncClient) -> None:

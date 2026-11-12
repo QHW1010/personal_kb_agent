@@ -17,6 +17,7 @@ from app.api.v1 import chat as chat_router
 from app.api.v1 import health as health_router
 from app.api.v1 import knowledge as knowledge_router
 from app.core.cache import close_cache, init_cache
+from app.agents.llm import warmup_llm
 from app.core.config import get_settings
 from app.core.errors import register_exception_handlers
 from app.core.logging import configure_logging, get_logger
@@ -45,6 +46,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # 失败不阻断启动，只是首个请求会慢（/health 会体现 embedding 状态）。
         if not await warmup_embedder():
             logger.warning("embedder_warmup_failed, first request may be slow")
+
+        # 真实 LLM 同样要预热：首次 TLS 握手 + 建连实测会给首个问题多加 5-7 秒
+        if cfg.llm_provider != "fake" and cfg.llm_warmup and not await warmup_llm():
+            logger.warning("llm_warmup_failed, first answer may be slow")
 
         backend = get_vector_store().name
         factory = get_session_factory()

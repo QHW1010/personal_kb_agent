@@ -1,20 +1,26 @@
 """LLM 工厂。
 
 两个实现：
+- openai：真实模型。DeepSeek / 通义 / vLLM / Azure 都兼容 OpenAI 协议，
+  所以统一走 ChatOpenAI，只换 base_url 与 model。
 - offline（fake）：LangChain 自定义 ChatModel，确定性、零网络、零成本，
-  用于本地演示与 CI。它仍然走 LangChain 的流式回调，所以 SSE 的
-  stream_mode="messages" 在两种 provider 下行为一致。
-- openai：真实模型，需要装 requirements-llm.txt 并配置 OPENAI_API_KEY。
+  用于本地演示与 CI。
+
+**两者都是 LangChain BaseChatModel**，这一点是硬要求：
+LangGraph 的 stream_mode="messages" 靠 BaseChatModel 的流式回调工作，
+任何"薄封装"过的普通 Python 对象都不会发出 token（历史 bug 就是这么来的）。
 """
 
 from __future__ import annotations
 
+import asyncio
 import re
+import time
 from collections.abc import AsyncIterator
 from typing import Any
 
 from langchain_core.language_models.chat_models import SimpleChatModel
-from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage
+from langchain_core.messages import AIMessageChunk, BaseMessage, HumanMessage
 from langchain_core.outputs import ChatGenerationChunk
 
 from app.core.config import get_settings
@@ -121,62 +127,127 @@ class OfflineChatModel(SimpleChatModel):
             yield ChatGenerationChunk(message=AIMessageChunk(content=piece))
 
 
-class OpenAICompatibleChatModel:
-    """薄封装，让上层只依赖 astream/ainvoke 两个方法。"""
+def _build_openai_chat_model(cfg: Any) -> Any:
+    """构造真实的 OpenAI 兼容模型。DeepSeek 只是 base_url 不同。"""
+    try:
+        from langchain_openai import ChatOpenAI
+    except ImportError as exc:  # pragma: no cover - 仅在缺包时触发
+        raise AppError(
+            "缺少 langchain-openai，请先 pip install -r requirements-llm.txt",
+            details={"provider": cfg.llm_provider},
+        ) from exc
 
-    def __init__(self, inner: Any) -> None:
-        self._inner = inner
-        self.model_name = getattr(inner, "model_name", "unknown")
+    if not cfg.llm_api_key:
+        raise AppError(
+            "LLM_PROVIDER=openai 但没有配置 API Key（OPENAI_API_KEY / LLM_API_KEY）",
+            details={"provider": cfg.llm_provider, "model": cfg.llm_model},
+        )
 
-    async def astream(self, messages: list[BaseMessage]) -> AsyncIterator[BaseMessage]:
-        async for chunk in self._inner.astream(messages):
-            yield chunk
-
-    async def ainvoke(self, messages: list[BaseMessage]) -> AIMessage:
-        return await self._inner.ainvoke(messages)
+    return ChatOpenAI(
+        model=cfg.llm_model,
+        api_key=cfg.llm_api_key,
+        base_url=cfg.llm_base_url,
+        temperature=cfg.llm_temperature,
+        max_tokens=cfg.llm_max_tokens,
+        streaming=True,
+        # usage 只在最后一个 chunk 回来的话，流式台账就记不到真实用量。
+        # 走 extra_body 而不是 stream_options 参数，避免 langchain 把它塞进
+        # model_kwargs 并打 UserWarning。
+        extra_body={"stream_options": {"include_usage": True}},
+        timeout=cfg.llm_timeout_seconds,
+        # 重试统一由 call_with_resilience 管：SDK 自己再重试会变成 3×3 放大
+        max_retries=0,
+    )
 
 
 _model: Any = None
 
 
 def get_chat_model() -> Any:
+    """返回统一的 BaseChatModel。流式与非流式都用它。"""
     global _model
     if _model is not None:
         return _model
 
     cfg = get_settings()
     if cfg.llm_provider == "openai":
-        try:
-            from langchain_openai import ChatOpenAI
-        except ImportError as exc:  # pragma: no cover - 仅真实模型路径触发
-            raise AppError(
-                "缺少 langchain-openai，请先 pip install -r requirements-llm.txt",
-                details={"provider": cfg.llm_provider},
-            ) from exc
-
-        inner = ChatOpenAI(
-            model=cfg.llm_model,
-            api_key=cfg.llm_api_key or "not-set",
-            base_url=cfg.llm_base_url,
-            temperature=cfg.llm_temperature,
-            max_tokens=cfg.llm_max_tokens,
-            streaming=True,
-            timeout=cfg.tool_timeout_seconds,
-            max_retries=cfg.tool_max_retries,
+        _model = _build_openai_chat_model(cfg)
+        logger.info(
+            "llm_provider=openai model=%s base_url=%s",
+            cfg.llm_model,
+            cfg.llm_base_url or "(默认)",
         )
-        _model = OpenAICompatibleChatModel(inner)
-        logger.info("llm_provider=openai model=%s", cfg.llm_model)
     else:
         _model = OfflineChatModel()
         logger.info("llm_provider=offline model=%s", _model.model_name)
     return _model
 
 
+def get_intent_model() -> Any:
+    """意图分类专用：同模型、温度为 0、只允许极短输出。
+
+    分类任务不该带创造性，也不该消耗正文的 max_tokens。
+    """
+    base = get_chat_model()
+    bind = getattr(base, "bind", None)
+    if bind is None:  # OfflineChatModel 也支持 bind（BaseChatModel 提供）
+        return base
+    return base.bind(temperature=0.0, max_tokens=64)
+
+
 def set_chat_model(model: Any) -> None:
+    """测试注入点：绕开真实网络，同时保证是 BaseChatModel。"""
     global _model
     _model = model
+
+
+def reset_chat_model() -> None:
+    global _model
+    _model = None
+
+
+def is_real_llm() -> bool:
+    return get_settings().llm_provider == "openai"
 
 
 def model_display_name() -> str:
     cfg = get_settings()
     return cfg.llm_model if cfg.llm_provider == "openai" else "offline-deterministic"
+
+
+def describe_llm() -> dict[str, Any]:
+    """给 /health 用的自述信息：不泄露 Key，只报有没有配。"""
+    cfg = get_settings()
+    return {
+        "provider": cfg.llm_provider,
+        "model": model_display_name(),
+        "base_url": cfg.llm_base_url or "",
+        "api_key_configured": bool(cfg.llm_api_key),
+        "temperature": cfg.llm_temperature,
+        "max_tokens": cfg.llm_max_tokens,
+    }
+
+
+async def warmup_llm() -> bool:
+    """启动期预热：建连接 + 打一次 1-token 请求。
+
+    首次调用真实网关要付 TLS 握手、DNS、连接池初始化的成本，实测能把
+    第一个用户问题的首字节推迟 5-7 秒。把它挪到启动期，用户感知的 TTFT
+    就只剩推理本身。失败不阻断启动 —— 网络抖动不该让服务起不来。
+    """
+    if not is_real_llm():
+        return True
+
+    started = time.perf_counter()
+    try:
+        model = get_chat_model()
+        await asyncio.wait_for(
+            model.bind(max_tokens=1).ainvoke([HumanMessage(content="ping")]),
+            timeout=get_settings().llm_intent_timeout_seconds,
+        )
+        elapsed = (time.perf_counter() - started) * 1000
+        logger.info("llm_warmup_ok model=%s elapsed_ms=%.0f", model_display_name(), elapsed)
+        return True
+    except Exception as exc:  # noqa: BLE001 - 预热失败只影响首个请求的快慢
+        logger.warning("llm_warmup_failed: %s", exc)
+        return False

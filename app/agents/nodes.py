@@ -7,6 +7,7 @@ route → retrieve / generate_sql → compose
 
 from __future__ import annotations
 
+import json
 import re
 from datetime import date, datetime
 from decimal import Decimal
@@ -16,7 +17,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from sqlalchemy import text
 
 from app.agents import prompts
-from app.agents.llm import get_chat_model
+from app.agents.llm import get_chat_model, get_intent_model, is_real_llm
 from app.agents.state import AgentState
 from app.core.config import get_settings
 from app.core.errors import ToolExecutionError
@@ -45,7 +46,8 @@ _ENTITY_RE = re.compile(
 def classify(question: str) -> str:
     """确定性路由：greeting → direct，聚合类问题 → sql，其余 → rag。
 
-    规则优先而非 LLM 优先，是为了让路由可解释、可单测、零成本。
+    它是 LLM 路由的**兜底**，不是唯一路径：真实模型可用时由模型判断意图，
+    模型超时/返回脏格式时回落到这里，保证路由永远不会"没有答案"。
     """
     q = question.strip()
     if _GREETING_RE.match(q):
@@ -53,6 +55,54 @@ def classify(question: str) -> str:
     if _AGG_RE.search(q) and _ENTITY_RE.search(q):
         return "sql"
     return "rag"
+
+
+# ---------------------------------------------------------------- LLM 意图路由
+_VALID_INTENTS = ("rag", "sql", "direct")
+_INTENT_JSON_RE = re.compile(r"\{.*?\}", re.DOTALL)
+
+
+def parse_intent(raw: str) -> tuple[str, str]:
+    """解析模型的意图输出，返回 (intent, reason)。
+
+    真实模型的输出不可控：可能带 ```json 围栏、可能多一句解释、
+    也可能直接回一个单词。三种形态都兼容，实在解析不出才抛错交给上层回落。
+    """
+    text_out = (raw or "").strip()
+    match = _INTENT_JSON_RE.search(text_out)
+    if match:
+        try:
+            payload = json.loads(match.group(0))
+        except json.JSONDecodeError:
+            payload = None
+        if isinstance(payload, dict):
+            intent = str(payload.get("intent", "")).strip().lower()
+            if intent in _VALID_INTENTS:
+                return intent, str(payload.get("reason", "")).strip()[:40]
+
+    lowered = text_out.lower()
+    for intent in _VALID_INTENTS:
+        if re.search(rf"\b{intent}\b", lowered):
+            return intent, "关键词解析"
+    raise ValueError(f"无法解析意图输出: {text_out[:60]!r}")
+
+
+async def _llm_intent(question: str) -> tuple[str, str]:
+    cfg = get_settings()
+    model = get_intent_model()
+    messages = [
+        SystemMessage(content=prompts.INTENT_SYSTEM_PROMPT),
+        HumanMessage(content=question),
+    ]
+    response = await call_with_resilience(
+        lambda: model.ainvoke(messages),
+        label="llm.intent",
+        timeout=cfg.llm_intent_timeout_seconds,
+        retries=1,
+    )
+    content = response.content
+    raw = content if isinstance(content, str) else str(content)
+    return parse_intent(raw)
 
 
 # ---------------------------------------------------------------- 离线 NL2SQL
@@ -160,11 +210,52 @@ async def _execute_sql(sql: str) -> tuple[list[dict[str, Any]], bool]:
 
 
 # ---------------------------------------------------------------- 节点
-async def route_node(state: AgentState) -> dict[str, Any]:
+async def intent_router_node(state: AgentState) -> dict[str, Any]:
+    """意图路由：寒暄直判 → LLM 分类 → 规则兜底。"""
     question = state["question"]
+    cfg = get_settings()
+
+    # 寒暄用正则整句匹配即可，不值得为"你好"花一次 API 调用与 800ms
+    if _GREETING_RE.match(question.strip()):
+        return {
+            "route": "direct",
+            "intent_source": "fast_rule",
+            "intent_reason": "寒暄直判",
+            "confidence": 0.6,
+        }
+
     route = classify(question)
-    logger.info("route conversation=%s route=%s q=%s", state.get("conversation_id"), route, question[:40])
-    return {"route": route}
+    source = "fast_rule"
+    reason = "规则命中"
+
+    if cfg.llm_provider != "fake":
+        try:
+            route, reason = await _llm_intent(question)
+            source = "llm"
+        except Exception as exc:  # noqa: BLE001 - 路由失败绝不能拖垮整轮问答
+            logger.warning("intent_llm_failed, fallback to rules: %s", exc)
+            route = classify(question)
+            source = "fallback"
+            reason = "模型路由失败，回落规则"
+
+    logger.info(
+        "intent conversation=%s route=%s source=%s q=%s",
+        state.get("conversation_id"),
+        route,
+        source,
+        question[:40],
+    )
+    return {
+        "route": route,
+        "intent_source": source,
+        "intent_reason": reason,
+        # 模型给出的路由比正则更可信，但也不给满分
+        "confidence": 0.85 if source == "llm" else 0.7,
+    }
+
+
+# 节点 id 与函数名的历史别名：外部（测试/文档）仍可能按旧名引用
+route_node = intent_router_node
 
 
 async def retrieve_node(state: AgentState) -> dict[str, Any]:
@@ -188,10 +279,9 @@ async def sql_node(state: AgentState) -> dict[str, Any]:
     可用文案而不是 500。
     """
     question = state["question"]
-    cfg = get_settings()
 
     plan: SQLPlan | None = None
-    if cfg.llm_provider != "fake":
+    if is_real_llm():
         try:
             plan = await _llm_sql_plan(question)
         except (ToolExecutionError, ValueError) as exc:
@@ -219,13 +309,17 @@ async def sql_node(state: AgentState) -> dict[str, Any]:
 
 
 async def _llm_sql_plan(question: str) -> SQLPlan:
+    cfg = get_settings()
     model = get_chat_model()
     messages = [
         SystemMessage(content=prompts.SQL_SYSTEM_PROMPT + "\n" + prompts.SQL_FEWSHOT),
         HumanMessage(content=question),
     ]
     response = await call_with_resilience(
-        lambda: model.ainvoke(messages), label="llm.nl2sql", timeout=20.0
+        lambda: model.ainvoke(messages),
+        label="llm.nl2sql",
+        timeout=cfg.llm_timeout_seconds,
+        retries=1,
     )
     raw = response.content if isinstance(response.content, str) else str(response.content)
     return SQLPlan(sql=_extract_sql(raw), rationale="LLM 生成", tables=[_guess_table(raw)])
@@ -250,35 +344,105 @@ def _build_context_block(state: AgentState) -> str:
     return "\n\n".join(parts)
 
 
-async def compose_node(state: AgentState) -> dict[str, Any]:
-    """调用 LLM 组装答案。流式 token 由 graph 的 stream_mode="messages" 捕获。"""
+def _usage_to_tokens(usage: Any) -> tuple[int, int]:
+    """把 LangChain 的 usage_metadata 归一成 (prompt, completion)。
+
+    不同 provider 的字段名不完全一致（input_tokens / prompt_tokens），
+    取不到就返回 0，由上层用 estimate_tokens 兜底。
+    """
+    if not isinstance(usage, dict):
+        return 0, 0
+    prompt = usage.get("input_tokens") or usage.get("prompt_tokens") or 0
+    completion = usage.get("output_tokens") or usage.get("completion_tokens") or 0
+    return int(prompt), int(completion)
+
+
+_CITE_MARK_RE = re.compile(r"\s*\[\d+(?:\s*[,，]\s*\d+)*\]")
+
+
+def strip_unsupported_citation_marks(answer: str, citations: list[dict[str, Any]]) -> str:
+    """没有引用时，把模型自作主张写的 [1] 抹掉。
+
+    引用列表是唯一事实来源。留着裸的 [1] 会让前端渲染成指向不存在的来源，
+    比不给标记更糟。有引用时原样保留 —— 那是模型按提示词要求标注的。
+    """
+    if citations or not answer:
+        return answer
+    cleaned = _CITE_MARK_RE.sub("", answer)
+    return re.sub(r"[ \t]{2,}", " ", cleaned).strip()
+
+
+def _prompt_for_route(state: AgentState, context: str) -> str:
+    """按路由选提示词：SQL 路线不该出现文档引用规则，否则模型会编造 [1]。"""
+    if state.get("route") == "sql" and not state.get("hits"):
+        return prompts.SQL_ANSWER_PROMPT.format(context=context)
+    return prompts.RAG_SYSTEM_PROMPT.format(context=context)
+
+
+async def synthesize_node(state: AgentState) -> dict[str, Any]:
+    """调用 LLM 合成答案（ synthesize 阶段）。
+
+    关键点：这里必须**真的流式消费** model.astream。token 经 LangChain 的
+    回调冒泡到 LangGraph，再由 stream_mode="messages" 推给 SSE；
+    如果把 astream 换成 ainvoke，客户端会等整段答案生成完才收到第一个字节。
+    """
+    cfg = get_settings()
     question = state["question"]
     context = _build_context_block(state)
-    system = SystemMessage(content=prompts.RAG_SYSTEM_PROMPT.format(context=context))
+    system = SystemMessage(content=_prompt_for_route(state, context))
 
     history = state.get("messages") or []
     messages = [system, *[m for m in history if m.type != "system"], HumanMessage(content=question)]
 
     model = get_chat_model()
 
-    async def _run() -> str:
+    async def _run() -> tuple[str, tuple[int, int]]:
         buffer: list[str] = []
+        usage: Any = None
         async for chunk in model.astream(messages):
-            content = chunk.content
-            if isinstance(content, str):
+            content = getattr(chunk, "content", "")
+            if isinstance(content, str) and content:
                 buffer.append(content)
-        return "".join(buffer)
+            meta = getattr(chunk, "usage_metadata", None)
+            if meta:
+                usage = meta
+        return "".join(buffer), _usage_to_tokens(usage)
 
-    answer = await call_with_resilience(_run, label="llm.compose", timeout=45.0)
+    try:
+        # retries=0：流式调用一旦重试，客户端会收到重复 token，宁可让上层报错
+        answer, (prompt_tokens, completion_tokens) = await call_with_resilience(
+            _run, label="llm.synthesize", timeout=cfg.llm_timeout_seconds, retries=0
+        )
+    except ToolExecutionError as exc:
+        logger.error("synthesize_failed: %s", exc)
+        return {
+            "answer": "",
+            "error": str(exc.message),
+            "confidence": 0.2,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+        }
+
     if not answer.strip():
         answer = "抱歉，本次生成没有返回有效内容，请换个问法再试一次。"
+    answer = strip_unsupported_citation_marks(answer, state.get("citations") or [])
 
-    prompt_text = system.content + "\n" + question + "\n" + "".join(m.content for m in history if isinstance(m.content, str))
+    hits = state.get("hits") or []
+    prompt_text = system.content + "\n" + question + "\n" + "".join(
+        m.content for m in history if isinstance(m.content, str)
+    )
     return {
         "answer": answer,
-        "prompt_tokens": estimate_tokens(prompt_text),
-        "completion_tokens": estimate_tokens(answer),
+        # 真实模型给了 usage 就用真实值；离线模型没有，走估算
+        "prompt_tokens": prompt_tokens or estimate_tokens(prompt_text),
+        "completion_tokens": completion_tokens or estimate_tokens(answer),
+        "confidence": 0.85 if hits else 0.4,
+        "needs_clarification": not hits,
     }
+
+
+# 旧名兼容（README / 早期文档里叫 compose）
+compose_node = synthesize_node
 
 
 async def direct_node(state: AgentState) -> dict[str, Any]:

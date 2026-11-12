@@ -237,11 +237,15 @@ async def stream(
 
     emitted: list[str] = []
     final_state: dict[str, Any] = {}
+    route_sent = False
+    citations_sent = False
     try:
         async for mode, payload in graph.astream(state, stream_mode=["messages", "values"]):
             if mode == "messages":
                 chunk, meta = payload  # type: ignore[misc]
-                if meta.get("langgraph_node") != "compose":
+                # 只有 synthesize 的 token 才是给用户看的正文；
+                # intent_router / sql_builder 也会调模型，它们的输出必须挡掉
+                if meta.get("langgraph_node") != "synthesize":
                     continue
                 content = getattr(chunk, "content", "")
                 if isinstance(content, str) and content:
@@ -249,6 +253,22 @@ async def stream(
                     yield sse_event("token", {"t": content})
             elif mode == "values":
                 final_state = payload  # type: ignore[assignment]
+                # 意图一旦确定就先告诉前端，用户不必等正文才知道走的是哪条链路
+                if not route_sent and final_state.get("intent_source"):
+                    route_sent = True
+                    yield sse_event(
+                        "route",
+                        {
+                            "route": final_state.get("route"),
+                            "source": final_state.get("intent_source"),
+                            "reason": final_state.get("intent_reason", ""),
+                        },
+                    )
+                # 检索完就把引用推给前端，边生成边能显示来源
+                citations = final_state.get("citations") or []
+                if not citations_sent and citations:
+                    citations_sent = True
+                    yield sse_event("citations", {"citations": citations})
     except Exception as exc:  # noqa: BLE001 - 流中断要保证客户端收到明确错误
         logger.exception("stream_failed conversation=%s err=%s", conversation_id, exc)
         if not emitted:
